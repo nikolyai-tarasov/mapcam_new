@@ -1,0 +1,8 @@
+.git
+.idea
+__pycache__
+*.pyc
+.env
+.env.docker
+.mypy_cache
+pytest_cache
