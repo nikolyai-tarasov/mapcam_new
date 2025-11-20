@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -53,6 +54,41 @@ class RedisCache:
     async def delete(cls, key: str) -> None:
         client = await cls.get_client()
         await client.delete(key)
+    
+    @classmethod
+    async def acquire_lock(
+        cls,
+        lock_key: str,
+        timeout: int = 30,
+        expire_seconds: int = 60,
+    ) -> bool:
+        """
+        Попытаться получить distributed lock.
+        
+        Args:
+            lock_key: Ключ для lock
+            timeout: Время ожидания в секундах
+            expire_seconds: Время жизни lock в секундах
+        
+        Returns:
+            True если lock получен, False иначе
+        """
+        client = await cls.get_client()
+        lock_value = f"lock:{asyncio.current_task().get_name() if asyncio.current_task() else 'unknown'}"
+        
+        result = await client.set(lock_key, lock_value, nx=True, ex=expire_seconds)
+        return result is True
+    
+    @classmethod
+    async def release_lock(cls, lock_key: str) -> None:
+        """
+        Освободить distributed lock.
+        
+        Args:
+            lock_key: Ключ для lock
+        """
+        client = await cls.get_client()
+        await client.delete(lock_key)
 
 
 

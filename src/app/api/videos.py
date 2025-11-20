@@ -3,13 +3,21 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from typing import Annotated
+from urllib.request import Request
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 
 from src.app.api.dependencies import get_current_user, get_video_service
+from src.app.api.helpers import ensure_found
+from src.app.core.constants import RateLimitConfig, StorageConfig
+from src.app.core.exceptions import CameraNotFoundError, UnsupportedVideoTypeError
+from src.app.core.logging_config import get_logger, log_extra
+from src.app.core.rate_limiting import limiter
 from src.app.models import User
 from src.app.schemas import VideoCreate, VideoFilter, VideoProcessingResultRead, VideoRead
-from src.app.services.video_service import CameraNotFoundError, UnsupportedVideoTypeError, VideoService
+from src.app.services.video_service import VideoService
+
+logger = get_logger(__name__)
 
 
 router = APIRouter(prefix="/videos", tags=["videos"])
@@ -46,14 +54,14 @@ async def get_video(
     video_id: uuid.UUID,
     video_service: VideoService = Depends(get_video_service),
 ) -> VideoRead:
-    video = await video_service.get_video(video_id)
-    if not video:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Video not found")
+    video = ensure_found(await video_service.get_video(video_id), "Video")
     return VideoRead.model_validate(video)
 
 
 @router.post("/upload", response_model=VideoRead, status_code=status.HTTP_201_CREATED)
+@limiter.limit(RateLimitConfig.UPLOAD_LIMIT)
 async def upload_video(
+    request: Request,
     camera_id: uuid.UUID = Form(...),
     title: str | None = Form(default=None),
     description: str | None = Form(default=None),
@@ -61,14 +69,42 @@ async def upload_video(
     current_user: User = Depends(get_current_user),
     video_service: VideoService = Depends(get_video_service),
 ) -> VideoRead:
+    """
+    Загрузить видео файл.
+    
+    Валидирует размер файла перед загрузкой для предотвращения memory issues.
+    """
+    file.file.seek(0, 2)
+    file_size = file.file.tell()
+    file.file.seek(0)
+    
+    if file_size > StorageConfig.MAX_VIDEO_SIZE:
+        logger.warning(
+            "File size exceeds limit",
+            extra=log_extra(
+                filename=file.filename,
+                file_size=file_size,
+                max_size=StorageConfig.MAX_VIDEO_SIZE,
+                user_id=str(current_user.id)
+            )
+        )
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File too large. Maximum size: {StorageConfig.MAX_VIDEO_SIZE / (1024 * 1024):.0f}MB"
+        )
+    
+    logger.info(
+        "Video upload request",
+        extra=log_extra(
+            filename=file.filename,
+            file_size=file_size,
+            camera_id=str(camera_id),
+            user_id=str(current_user.id)
+        )
+    )
+    
     payload = VideoCreate(camera_id=camera_id, title=title, description=description)
-    try:
-        video = await video_service.upload_video(current_user, file, payload)
-    except UnsupportedVideoTypeError as exc:
-        raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail=str(exc)) from exc
-    except CameraNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-
+    video = await video_service.upload_video(current_user, file, payload)
     return VideoRead.model_validate(video)
 
 
@@ -78,10 +114,16 @@ async def delete_video(
     video_service: VideoService = Depends(get_video_service),
     current_user: User = Depends(get_current_user),
 ) -> None:
-    video = await video_service.get_video(video_id)
-    if not video:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Video not found")
+    video = ensure_found(await video_service.get_video(video_id), "Video")
     if video.uploader_id and video.uploader_id != current_user.id:
+        logger.warning(
+            "Unauthorized video deletion attempt",
+            extra=log_extra(
+                video_id=str(video_id),
+                user_id=str(current_user.id),
+                owner_id=str(video.uploader_id)
+            )
+        )
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You can delete only your own videos")
     await video_service.delete_video(video)
 
@@ -91,9 +133,7 @@ async def get_video_results(
     video_id: uuid.UUID,
     video_service: VideoService = Depends(get_video_service),
 ) -> list[VideoProcessingResultRead]:
-    video = await video_service.get_video(video_id)
-    if not video:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Video not found")
+    video = ensure_found(await video_service.get_video(video_id), "Video")
     return [VideoProcessingResultRead.model_validate(result) for result in video.processing_results]
 
 
