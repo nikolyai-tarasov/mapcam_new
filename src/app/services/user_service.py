@@ -1,18 +1,18 @@
 from __future__ import annotations
 
+import logging
 import uuid
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.app.core.exceptions import UserAlreadyExistsError
 from src.app.core.security import hash_password
 from src.app.models import User
 from src.app.schemas.user import UserCreate
 
-
-class UserAlreadyExistsError(Exception):
-    """Raised when attempting to register an already existing user."""
+logger = logging.getLogger(__name__)
 
 
 class UserService:
@@ -20,8 +20,11 @@ class UserService:
         self._session = session
 
     async def create_user(self, user_in: UserCreate) -> User:
+        """Создает нового пользователя."""
+        logger.info("Creating user", extra={"email": user_in.email})
         existing = await self.get_by_email(user_in.email)
         if existing:
+            logger.warning("User already exists", extra={"email": user_in.email})
             raise UserAlreadyExistsError("User with this email already exists.")
 
         user = User(
@@ -33,8 +36,10 @@ class UserService:
         self._session.add(user)
         try:
             await self._session.commit()
+            logger.info("User created successfully", extra={"user_id": str(user.id), "email": user_in.email})
         except IntegrityError as exc:
             await self._session.rollback()
+            logger.warning("User creation failed due to integrity error", extra={"email": user_in.email})
             raise UserAlreadyExistsError("User with this email already exists.") from exc
 
         await self._session.refresh(user)
@@ -49,7 +54,3 @@ class UserService:
         stmt = select(User).where(User.id == user_id)
         result = await self._session.execute(stmt)
         return result.scalar_one_or_none()
-
-
-
-

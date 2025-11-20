@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime
 from typing import Annotated
@@ -7,9 +8,13 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 
 from src.app.api.dependencies import get_current_user, get_video_service
+from src.app.api.helpers import ensure_found
+from src.app.core.exceptions import AuthorizationError, VideoNotFoundError
 from src.app.models import User
 from src.app.schemas import VideoCreate, VideoFilter, VideoProcessingResultRead, VideoRead
-from src.app.services.video_service import CameraNotFoundError, UnsupportedVideoTypeError, VideoService
+from src.app.services.video_service import VideoService
+
+logger = logging.getLogger(__name__)
 
 
 router = APIRouter(prefix="/videos", tags=["videos"])
@@ -46,9 +51,9 @@ async def get_video(
     video_id: uuid.UUID,
     video_service: VideoService = Depends(get_video_service),
 ) -> VideoRead:
-    video = await video_service.get_video(video_id)
-    if not video:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Video not found")
+    """Получает видео по ID."""
+    logger.debug("Getting video", extra={"video_id": str(video_id)})
+    video = ensure_found(await video_service.get_video(video_id), "Video")
     return VideoRead.model_validate(video)
 
 
@@ -61,14 +66,17 @@ async def upload_video(
     current_user: User = Depends(get_current_user),
     video_service: VideoService = Depends(get_video_service),
 ) -> VideoRead:
+    """Загружает видеофайл."""
+    logger.info(
+        "Video upload request",
+        extra={
+            "user_id": str(current_user.id),
+            "camera_id": str(camera_id),
+            "filename": file.filename,
+        }
+    )
     payload = VideoCreate(camera_id=camera_id, title=title, description=description)
-    try:
-        video = await video_service.upload_video(current_user, file, payload)
-    except UnsupportedVideoTypeError as exc:
-        raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail=str(exc)) from exc
-    except CameraNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-
+    video = await video_service.upload_video(current_user, file, payload)
     return VideoRead.model_validate(video)
 
 
@@ -78,11 +86,15 @@ async def delete_video(
     video_service: VideoService = Depends(get_video_service),
     current_user: User = Depends(get_current_user),
 ) -> None:
-    video = await video_service.get_video(video_id)
-    if not video:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Video not found")
+    """Удаляет видео."""
+    logger.info("Video delete request", extra={"video_id": str(video_id), "user_id": str(current_user.id)})
+    video = ensure_found(await video_service.get_video(video_id), "Video")
     if video.uploader_id and video.uploader_id != current_user.id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You can delete only your own videos")
+        logger.warning(
+            "Unauthorized video deletion attempt",
+            extra={"video_id": str(video_id), "user_id": str(current_user.id), "owner_id": str(video.uploader_id)}
+        )
+        raise AuthorizationError("You can delete only your own videos")
     await video_service.delete_video(video)
 
 
@@ -91,11 +103,6 @@ async def get_video_results(
     video_id: uuid.UUID,
     video_service: VideoService = Depends(get_video_service),
 ) -> list[VideoProcessingResultRead]:
-    video = await video_service.get_video(video_id)
-    if not video:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Video not found")
+    """Получает результаты обработки видео."""
+    video = ensure_found(await video_service.get_video(video_id), "Video")
     return [VideoProcessingResultRead.model_validate(result) for result in video.processing_results]
-
-
-
-

@@ -7,7 +7,7 @@ import uuid
 from collections.abc import Callable
 from typing import Any
 
-import cv2  # type: ignore[import-untyped]
+import cv2
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.app.db.db_session import async_db_session
@@ -42,7 +42,7 @@ class VideoProcessingService:
             try:
                 thumbnail_key, attributes = await self._extract_first_frame(video)
                 await service.mark_processing_completed(video, thumbnail_key=thumbnail_key, attributes=attributes)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 await service.mark_processing_failed(video, reason=str(exc))
                 logger.exception("Processing failed for video %s: %s", video_id, exc)
 
@@ -85,10 +85,6 @@ class VideoProcessingService:
 
 video_processing_service = VideoProcessingService()
 
-from src.app.services.video_processing_queue import video_processing_queue  # noqa: E402
+from src.app.services.video_processing_queue import video_processing_queue
 
 video_processing_queue.set_processor(video_processing_service.process_video)
-
-
-
-
