@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import random
 import uuid
 from datetime import datetime, timezone
@@ -9,6 +10,7 @@ from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload, selectinload
 
+from src.app.core.constants import CacheConfig
 from src.app.models import Camera, Video
 from src.app.schemas import (
     CameraFilter,
@@ -18,6 +20,8 @@ from src.app.schemas import (
     CameraRead,
 )
 from src.app.services.redis_cache import RedisCache
+
+logger = logging.getLogger(__name__)
 
 CAMERA_GEOJSON_CACHE_KEY = "mapcam:geojson:cameras"
 
@@ -37,22 +41,55 @@ class CameraService:
         return result.scalars().first()
 
     async def get_geojson(
-        self,
-        camera_filter: CameraFilter | None = None,
-        use_cache: bool = True,
+            self,
+            camera_filter: CameraFilter | None = None,
+            use_cache: bool = True,
     ) -> CameraGeoJsonCollection:
-        if use_cache and not camera_filter:
-            cached = await RedisCache.get_json(CAMERA_GEOJSON_CACHE_KEY)
-            if cached:
-                return CameraGeoJsonCollection.model_validate(cached)
+        """
+        Получает камеры в формате GeoJSON с предотвращением штурма кэша.
 
-        cameras = await self.list_cameras(camera_filter)
-        collection = self._to_geojson(cameras)
+        Args:
+            camera_filter: Опциональный фильтр для камер
+            use_cache: Использовать ли кэш
 
-        if use_cache and not camera_filter:
-            await RedisCache.set_json(CAMERA_GEOJSON_CACHE_KEY, collection.model_dump(mode="json"), expire_seconds=300)
+        Returns:
+            GeoJSON коллекция камер
+        """
+        if not use_cache or camera_filter:
+            logger.debug("Fetching cameras without cache", extra={"has_filter": camera_filter is not None})
+            cameras = await self.list_cameras(camera_filter)
+            collection = self._to_geojson(cameras)
+            return collection
 
-        return collection
+        cached = await RedisCache.get_json(CAMERA_GEOJSON_CACHE_KEY)
+        if cached:
+            logger.debug("GeoJSON cache hit")
+            return CameraGeoJsonCollection.model_validate(cached)
+
+        logger.debug("GeoJSON cache miss, acquiring lock")
+        try:
+            async with RedisCache.lock_context(CAMERA_GEOJSON_CACHE_KEY, timeout=CacheConfig.LOCK_TIMEOUT_SECONDS):
+                cached = await RedisCache.get_json(CAMERA_GEOJSON_CACHE_KEY)
+                if cached:
+                    logger.debug("GeoJSON found in cache after lock acquisition")
+                    return CameraGeoJsonCollection.model_validate(cached)
+
+                logger.info("Computing GeoJSON for cameras")
+                cameras = await self.list_cameras(camera_filter)
+                collection = self._to_geojson(cameras)
+
+                await RedisCache.set_json(
+                    CAMERA_GEOJSON_CACHE_KEY,
+                    collection.model_dump(mode="json"),
+                    expire_seconds=CacheConfig.GEOJSON_TTL_SECONDS
+                )
+                logger.debug("GeoJSON computed and cached")
+                return collection
+        except RuntimeError as exc:
+            logger.warning("Failed to acquire lock, computing directly", extra={"error": str(exc)})
+            cameras = await self.list_cameras(camera_filter)
+            collection = self._to_geojson(cameras)
+            return collection
 
     async def invalidate_geojson_cache(self) -> None:
         await RedisCache.delete(CAMERA_GEOJSON_CACHE_KEY)
@@ -143,7 +180,6 @@ class CameraService:
             )
             self._session.add(camera)
             await self._session.flush()
-            # Загружаем камеру заново с videos через selectinload, чтобы свойство has_video работало корректно
             camera_id = camera.id
             stmt = select(Camera).where(Camera.id == camera_id).options(selectinload(Camera.videos))
             result = await self._session.execute(stmt)
@@ -153,7 +189,3 @@ class CameraService:
         await self._session.commit()
         await self.invalidate_geojson_cache()
         return seeded
-
-
-
-

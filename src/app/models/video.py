@@ -5,7 +5,7 @@ from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import DateTime, Enum as SqlEnum, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import DateTime, Enum as SqlEnum, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -30,6 +30,10 @@ class Video(Base):
     __tablename__ = "videos"
     __table_args__ = (
         UniqueConstraint("storage_key", name="uq_video_storage_key"),
+        Index("ix_video_status_uploaded_at", "status", "uploaded_at"),
+        Index("ix_video_camera_status", "camera_id", "status"),
+        Index("ix_video_uploader_uploaded", "uploader_id", "uploaded_at"),
+        Index("ix_video_processing_status", "processing_status"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -126,7 +130,6 @@ class VideoProcessingResult(Base):
 if TYPE_CHECKING:
     from src.app.models.camera import Camera
     from src.app.models.user import User
-
 
 
 
