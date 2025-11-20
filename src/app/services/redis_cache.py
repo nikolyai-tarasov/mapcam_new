@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
+from typing import Any, TypeVar
 
 from redis import asyncio as redis_asyncio
 
 from src.app.core.config import settings
+
+T = TypeVar("T")
 
 
 class RedisCache:
@@ -31,13 +33,22 @@ class RedisCache:
             cls._client = None
 
     @classmethod
-    async def get_json(cls, key: str) -> Any:
+    async def get_json(cls, key: str) -> dict[str, Any] | list[Any] | None:
+        """
+        Получает JSON значение из кэша.
+
+        Returns:
+            Распарсенное JSON значение (dict или list) или None если не найдено/невалидно
+        """
         client = await cls.get_client()
         raw = await client.get(key)
         if raw is None:
             return None
         try:
-            return json.loads(raw)
+            parsed = json.loads(raw)
+            if isinstance(parsed, (dict, list)):
+                return parsed
+            return None
         except json.JSONDecodeError:
             return None
 
@@ -54,42 +65,44 @@ class RedisCache:
     async def delete(cls, key: str) -> None:
         client = await cls.get_client()
         await client.delete(key)
-    
+
     @classmethod
-    async def acquire_lock(
-        cls,
-        lock_key: str,
-        timeout: int = 30,
-        expire_seconds: int = 60,
-    ) -> bool:
+    async def acquire_lock(cls, key: str, timeout: int = 30) -> bool:
         """
-        Попытаться получить distributed lock.
-        
+        Получает распределенную блокировку.
+
         Args:
-            lock_key: Ключ для lock
-            timeout: Время ожидания в секундах
-            expire_seconds: Время жизни lock в секундах
-        
+            key: Ключ блокировки
+            timeout: Таймаут блокировки в секундах
+
         Returns:
-            True если lock получен, False иначе
+            True если блокировка получена, False в противном случае
         """
         client = await cls.get_client()
-        lock_value = f"lock:{asyncio.current_task().get_name() if asyncio.current_task() else 'unknown'}"
-        
-        result = await client.set(lock_key, lock_value, nx=True, ex=expire_seconds)
+        lock_key = f"{key}:lock"
+        result = await client.set(lock_key, "1", ex=timeout, nx=True)
         return result is True
-    
+
     @classmethod
-    async def release_lock(cls, lock_key: str) -> None:
-        """
-        Освободить distributed lock.
-        
-        Args:
-            lock_key: Ключ для lock
-        """
+    async def release_lock(cls, key: str) -> None:
+        """Освобождает распределенную блокировку."""
         client = await cls.get_client()
+        lock_key = f"{key}:lock"
         await client.delete(lock_key)
 
+    @classmethod
+    async def lock_context(cls, key: str, timeout: int = 30):
+        """
+        Контекстный менеджер для распределенной блокировки.
 
+        Usage:
+            async with RedisCache.lock_context("my_key"):
+                # Критическая секция
+                pass
+        """
 
-
+        class LockContext:
+            def __init__(self, cache_cls, lock_key: str, timeout: int):
+                self.cache_cls = cache_cls
+                self.lock_key = lock_key
+                self.timeout

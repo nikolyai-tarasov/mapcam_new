@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException, status
@@ -7,8 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.app.core.config import settings
-from src.app.core.exceptions import UserAlreadyExistsError
-from src.app.core.logging_config import get_logger, log_extra
+from src.app.core.exceptions import AuthenticationError
 from src.app.core.security import (
     create_access_token,
     generate_refresh_token,
@@ -17,9 +17,9 @@ from src.app.core.security import (
 )
 from src.app.models import RefreshToken, User
 from src.app.schemas import LoginRequest, TokenPair, UserCreate
-from src.app.services.user_service import UserService
+from src.app.services.user_service import UserAlreadyExistsError, UserService
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class AuthService:
@@ -28,37 +28,30 @@ class AuthService:
         self._user_service = user_service
 
     async def register_user(self, payload: UserCreate) -> User:
-        logger.info("Registering new user", extra=log_extra(email=payload.email))
-        try:
-            user = await self._user_service.create_user(payload)
-            logger.info("User registered successfully", extra=log_extra(user_id=str(user.id)))
-            return user
-        except UserAlreadyExistsError as exc:
-            logger.warning("User registration failed - already exists", extra=log_extra(email=payload.email))
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        """Регистрирует нового пользователя."""
+        logger.info("Registering user", extra={"email": payload.email})
+        return await self._user_service.create_user(payload)
 
     async def authenticate(self, login_data: LoginRequest) -> TokenPair:
-        logger.info("User authentication attempt", extra=log_extra(email=login_data.email))
+        """Аутентифицирует пользователя и выдает пару токенов."""
+        logger.info("Authenticating user", extra={"email": login_data.email})
         user = await self._user_service.get_by_email(login_data.email)
         if not user or not verify_password(login_data.password, user.hashed_password):
-            logger.warning("Authentication failed", extra=log_extra(email=login_data.email))
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Incorrect email or password",
-            )
+            logger.warning("Authentication failed", extra={"email": login_data.email})
+            raise AuthenticationError("Incorrect email or password")
 
-        logger.info("User authenticated successfully", extra=log_extra(user_id=str(user.id)))
+        logger.info("User authenticated successfully", extra={"user_id": str(user.id)})
         return await self._issue_token_pair(user)
 
     async def refresh(self, refresh_token: str) -> TokenPair:
         """
-        Обновить access token используя refresh token.
-        
-        Использует SELECT FOR UPDATE для предотвращения race condition
-        при одновременном использовании одного refresh token.
+        Обновляет access token с помощью refresh token.
+
+        Использует SELECT FOR UPDATE для предотвращения состояний гонки
+        при множественных запросах на обновление с одним токеном.
         """
         hashed_token = hash_refresh_token(refresh_token)
-        
+
         stmt = (
             select(RefreshToken)
             .where(RefreshToken.token == hashed_token)
@@ -70,26 +63,24 @@ class AuthService:
 
         if not token_entry:
             logger.warning("Invalid refresh token used")
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
+            raise AuthenticationError("Invalid refresh token")
 
-        if token_entry.expires_at < datetime.now(timezone.utc):
+        now = datetime.now(timezone.utc)
+        if token_entry.expires_at < now:
             token_entry.is_revoked = True
             await self._session.commit()
-            logger.warning("Expired refresh token used", extra=log_extra(token_id=str(token_entry.id)))
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Refresh token expired",
-            )
+            logger.warning("Expired refresh token used", extra={"token_id": str(token_entry.id)})
+            raise AuthenticationError("Refresh token expired")
 
         user = await self._user_service.get_by_id(token_entry.user_id)
         if not user:
-            logger.warning("User not found for refresh token", extra=log_extra(user_id=str(token_entry.user_id)))
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+            logger.warning("User not found for refresh token", extra={"user_id": str(token_entry.user_id)})
+            raise AuthenticationError("User not found")
 
         token_entry.is_revoked = True
         await self._session.commit()
-        
-        logger.info("Refresh token used successfully", extra=log_extra(user_id=str(user.id)))
+        logger.info("Refresh token revoked and new tokens issued", extra={"user_id": str(user.id)})
+
         return await self._issue_token_pair(user)
 
     async def _issue_token_pair(self, user: User) -> TokenPair:
@@ -106,7 +97,3 @@ class AuthService:
         await self._session.commit()
 
         return TokenPair(access_token=access_token, refresh_token=refresh_token_raw)
-
-
-
-

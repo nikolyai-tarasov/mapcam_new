@@ -1,22 +1,36 @@
-"""Кастомные исключения для приложения."""
+"""Пользовательские исключения для приложения."""
 
 
 class UnsupportedVideoTypeError(Exception):
-    """Исключение при попытке загрузить неподдерживаемый тип видео."""
+    """Вызывается когда тип видеофайла не поддерживается."""
     pass
 
 
 class CameraNotFoundError(Exception):
-    """Исключение при отсутствии камеры."""
-    pass
-
-
-class MinioStorageError(Exception):
-    """Исключение при ошибках работы с хранилищем."""
+    """Вызывается когда камера не найдена."""
     pass
 
 
 class UserAlreadyExistsError(Exception):
-    """Исключение при попытке создать пользователя с существующим email."""
+    """Вызывается когда пользователь уже существует."""
     pass
 
+
+class VideoNotFoundError(Exception):
+    """Вызывается когда видео не найдено."""
+    pass
+
+
+class StorageError(Exception):
+    """Вызывается когда операция с хранилищем не удалась."""
+    pass
+
+
+class AuthenticationError(Exception):
+    """Вызывается когда аутентификация не удалась."""
+    pass
+
+
+class AuthorizationError(Exception):
+    """Вызывается когда пользователь не авторизован."""
+    pass

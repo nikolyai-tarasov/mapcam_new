@@ -30,7 +30,6 @@ class Video(Base):
     __tablename__ = "videos"
     __table_args__ = (
         UniqueConstraint("storage_key", name="uq_video_storage_key"),
-        # Индексы для улучшения производительности запросов
         Index("ix_video_status_uploaded_at", "status", "uploaded_at"),
         Index("ix_video_camera_status", "camera_id", "status"),
         Index("ix_video_uploader_uploaded", "uploader_id", "uploaded_at"),
@@ -131,7 +130,6 @@ class VideoProcessingResult(Base):
 if TYPE_CHECKING:
     from src.app.models.camera import Camera
     from src.app.models.user import User
-
 
 
 

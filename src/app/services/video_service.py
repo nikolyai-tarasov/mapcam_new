@@ -10,55 +10,72 @@ from sqlalchemy import Select, and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
-from src.app.core.exceptions import CameraNotFoundError, UnsupportedVideoTypeError
-from src.app.core.logging_config import get_logger, log_extra
+from src.app.core.constants import StorageConfig
+from src.app.core.exceptions import CameraNotFoundError, StorageError, UnsupportedVideoTypeError, VideoNotFoundError
+from src.app.core.logging_config import LoggerMixin
 from src.app.models import Camera, User, Video, VideoProcessingStatus, VideoStatus
 from src.app.schemas import VideoCreate, VideoFilter
 from src.app.services.camera_service import CameraService
 from src.app.services.storage_service import MinioStorage, minio_storage
 from src.app.services.video_processing_queue import video_processing_queue
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class VideoService:
+    """Сервис для управления операциями с видео."""
+
     def __init__(self, session: AsyncSession, storage: MinioStorage | None = None) -> None:
         self._session = session
         self._storage = storage or minio_storage
         self._camera_service = CameraService(session)
 
     async def upload_video(
-        self,
-        uploader: User | None,
-        file: UploadFile,
-        payload: VideoCreate,
+            self,
+            uploader: User | None,
+            file: UploadFile,
+            payload: VideoCreate,
     ) -> Video:
+        """
+        Загружает видеофайл и создает запись в базе данных.
+
+        Args:
+            uploader: Пользователь, загружающий видео (None для анонимного)
+            file: Видеофайл из multipart загрузки
+            payload: Метаданные видео (название, описание, камера)
+
+        Returns:
+            Созданный экземпляр Video с заполненным storage_key
+
+        Raises:
+            UnsupportedVideoTypeError: Если файл не MP4
+            CameraNotFoundError: Если указанная камера не существует
+            StorageError: Если загрузка в MinIO не удалась
+        """
         logger.info(
             "Uploading video",
-            extra=log_extra(
-                uploader_id=str(uploader.id) if uploader else None,
-                filename=file.filename,
-                content_type=file.content_type,
-                camera_id=str(payload.camera_id) if payload.camera_id else None,
-            )
+            extra={
+                "uploader_id": str(uploader.id) if uploader else None,
+                "filename": file.filename,
+                "content_type": file.content_type,
+                "camera_id": str(payload.camera_id) if payload.camera_id else None,
+            }
         )
-        
+
         try:
             await self._storage.ensure_bucket()
             self._validate_file(file)
+            self._validate_file_size(file)
 
             camera: Camera | None = None
             if payload.camera_id:
                 camera = await self._camera_service.get_camera(payload.camera_id)
                 if not camera:
-                    logger.warning(
-                        "Camera not found",
-                        extra=log_extra(camera_id=str(payload.camera_id))
-                    )
+                    logger.warning("Camera not found", extra={"camera_id": str(payload.camera_id)})
                     raise CameraNotFoundError("Camera not found.")
 
             object_name = await self._storage.upload_file(file)
-            logger.debug("Video uploaded to storage", extra=log_extra(storage_key=object_name))
+            logger.debug("File uploaded to storage", extra={"object_name": object_name})
 
             video = Video(
                 camera=camera,
@@ -74,36 +91,26 @@ class VideoService:
             self._session.add(video)
             await self._session.commit()
             await self._session.refresh(video)
-            
-            logger.info(
-                "Video record created",
-                extra=log_extra(video_id=str(video.id))
-            )
+
+            logger.info("Video record created", extra={"video_id": str(video.id)})
 
             await video_processing_queue.enqueue(video.id, uploader.id if uploader else None)
             await self._camera_service.invalidate_geojson_cache()
 
-            logger.info(
-                "Video upload completed successfully",
-                extra=log_extra(video_id=str(video.id))
-            )
+            logger.info("Video uploaded successfully", extra={"video_id": str(video.id)})
             return video
-        except Exception as exc:
-            logger.exception(
-                "Failed to upload video",
-                extra=log_extra(
-                    filename=file.filename,
-                    error=str(exc)
-                )
-            )
+        except (UnsupportedVideoTypeError, CameraNotFoundError):
             raise
+        except Exception as exc:
+            logger.exception("Failed to upload video", extra={"filename": file.filename})
+            raise StorageError(f"Failed to upload video: {str(exc)}") from exc
 
     async def list_videos(
-        self,
-        filters: VideoFilter | None = None,
-        *,
-        limit: int | None = None,
-        offset: int = 0,
+            self,
+            filters: VideoFilter | None = None,
+            *,
+            limit: int | None = None,
+            offset: int = 0,
     ) -> list[Video]:
         stmt = self._build_video_query(filters)
         if limit is not None:
@@ -120,20 +127,22 @@ class VideoService:
         return int(result.scalar_one())
 
     async def get_video(self, video_id: uuid.UUID) -> Video | None:
+        """Получает видео по ID с загруженными связанными сущностями."""
+        logger.debug("Getting video", extra={"video_id": str(video_id)})
         stmt = (
             select(Video)
             .options(joinedload(Video.camera), joinedload(Video.uploader), joinedload(Video.processing_results))
             .where(Video.id == video_id)
         )
         result = await self._session.execute(stmt)
-        return result.scalars().first()
+        video = result.scalars().first()
+        if not video:
+            logger.debug("Video not found", extra={"video_id": str(video_id)})
+        return video
 
     async def delete_video(self, video: Video) -> None:
-        logger.info(
-            "Deleting video",
-            extra=log_extra(video_id=str(video.id), storage_key=video.storage_key)
-        )
-        
+        """Удаляет видео и связанные файлы из хранилища."""
+        logger.info("Deleting video", extra={"video_id": str(video.id)})
         try:
             await self._storage.remove_object(video.storage_key)
             if video.thumbnail_key:
@@ -141,17 +150,10 @@ class VideoService:
             await self._session.delete(video)
             await self._session.commit()
             await self._camera_service.invalidate_geojson_cache()
-            
-            logger.info(
-                "Video deleted successfully",
-                extra=log_extra(video_id=str(video.id))
-            )
+            logger.info("Video deleted successfully", extra={"video_id": str(video.id)})
         except Exception as exc:
-            logger.exception(
-                "Failed to delete video",
-                extra=log_extra(video_id=str(video.id), error=str(exc))
-            )
-            raise
+            logger.exception("Failed to delete video", extra={"video_id": str(video.id)})
+            raise StorageError(f"Failed to delete video: {str(exc)}") from exc
 
     async def mark_processing_started(self, video: Video) -> None:
         video.status = VideoStatus.PROCESSING
@@ -159,10 +161,10 @@ class VideoService:
         await self._session.commit()
 
     async def mark_processing_completed(
-        self,
-        video: Video,
-        thumbnail_key: str | None = None,
-        attributes: dict[str, Any] | None = None,
+            self,
+            video: Video,
+            thumbnail_key: str | None = None,
+            attributes: dict[str, Any] | None = None,
     ) -> None:
         video.status = VideoStatus.READY
         video.processing_status = VideoProcessingStatus.COMPLETED
@@ -214,15 +216,26 @@ class VideoService:
 
     @staticmethod
     def _validate_file(file: UploadFile) -> None:
+        """Проверяет что файл является поддерживаемым типом видео."""
         filename = file.filename or ""
         content_type = file.content_type or mimetypes.guess_type(filename)[0] or ""
         if not filename.lower().endswith(".mp4") and content_type != "video/mp4":
-            logger.warning(
-                "Unsupported video type",
-                extra=log_extra(filename=filename, content_type=content_type)
-            )
+            logger.warning("Unsupported video type", extra={"filename": filename, "content_type": content_type})
             raise UnsupportedVideoTypeError("Only MP4 videos are supported.")
 
+    @staticmethod
+    def _validate_file_size(file: UploadFile) -> None:
+        """Проверяет что размер файла находится в пределах ограничений."""
+        file.file.seek(0, 2)
+        size = file.file.tell()
+        file.file.seek(0)
 
-
+        if size > StorageConfig.MAX_VIDEO_SIZE:
+            logger.warning(
+                "File too large",
+                extra={"filename": file.filename, "size": size, "max_size": StorageConfig.MAX_VIDEO_SIZE}
+            )
+            raise UnsupportedVideoTypeError(
+                f"File too large. Max size: {StorageConfig.MAX_VIDEO_SIZE / (1024 * 1024):.0f}MB"
+            )
 

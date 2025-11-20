@@ -24,6 +24,7 @@ class CacheConfig:
     """Конфигурация кэширования."""
     GEOJSON_TTL_SECONDS = 300
     VIDEO_METADATA_TTL_SECONDS = 1800
+    LOCK_TIMEOUT_SECONDS = 30
 
 
 class StorageConfig:
@@ -34,11 +35,8 @@ class StorageConfig:
 
 
 class RateLimitConfig:
-    """Конфигурация rate limiting."""
+    """Конфигурация ограничения запросов."""
     REGISTER_LIMIT = "5/hour"
     UPLOAD_LIMIT = "10/hour"
-    LOGIN_LIMIT = "20/hour"
-
-
-
-
+    LOGIN_LIMIT = "10/minute"
+    GENERAL_LIMIT = "100/hour"
